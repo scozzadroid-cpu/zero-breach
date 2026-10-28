@@ -30,3 +30,7 @@ SPEC-scanner.md
 REVIEW-*.md
 RELEASE-CANDIDATE-*.md
 
+
+# Android module build output
+android/dist/
+android/module/webroot/data.js
