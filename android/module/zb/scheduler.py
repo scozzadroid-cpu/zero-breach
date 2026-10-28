@@ -8,6 +8,7 @@ are re-read every cycle.
 
 SIGUSR1 runs a scan now (the module's Action button and the web page send it).
 SIGHUP re-reads config.sh and rewrites the web page (set_config.py sends it).
+SIGUSR2 sends a test notification and records whether it was shown.
 A scheduled scan only starts while a charger is connected when ONLY_CHARGING=1; it
 keeps waiting for one until the late window closes, then the night is skipped.
 """
@@ -60,6 +61,10 @@ class Reload(Exception):
     """Raised by SIGHUP while the scheduler is waiting."""
 
 
+class TestNotify(Exception):
+    """Raised by SIGUSR2 while the scheduler is waiting."""
+
+
 _waiting = False
 
 
@@ -71,6 +76,11 @@ def _on_usr1(_sig, _frame):
 def _on_hup(_sig, _frame):
     if _waiting:
         raise Reload()
+
+
+def _on_usr2(_sig, _frame):
+    if _waiting:
+        raise TestNotify()
 
 
 def _on_term(_sig, _frame):
@@ -169,34 +179,76 @@ def set_desc(text):
 
 
 LAST_NOTIFY = {"ok": None}
+SHELL_UID = 2000
+
+
+def _drop_to_shell():
+    """preexec for the notification command: become the Shell user. Termux's Python
+    is built without os.setuid and subprocess' user=/group=, so use libc directly."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    for call, args in ((libc.setgroups, (0, None)),
+                       (libc.setresgid, (SHELL_UID,) * 3),
+                       (libc.setresuid, (SHELL_UID,) * 3)):
+        if call(*args) != 0:
+            raise OSError(ctypes.get_errno(), "cannot become the Shell user")
 
 
 def notify(title, text):
-    """Post a notification and check it really appeared: Android silently drops
-    notifications of an app the user has blocked, and `cmd notification post`
-    posts as the Shell app, which some phones block."""
+    """Post a notification and check it really appeared.
+
+    `cmd notification post` posts on behalf of the calling package. Run as root it
+    asks for a package called "root", which does not exist, and the notification
+    service drops the request without telling the caller. So the command is run
+    as the Shell user (uid 2000), which posts as com.android.shell. The result is
+    verified in the active-notification listing (the post is asynchronous)."""
+    as_shell = {"preexec_fn": _drop_to_shell} if os.geteuid() == 0 else {}
     try:
         subprocess.run(["/system/bin/cmd", "notification", "post", "-S", "bigtext",
                         "-t", title, "zero_breach", text],
-                       capture_output=True, timeout=30, check=True)
-        listing = subprocess.run(["/system/bin/cmd", "notification", "list"],
-                                 capture_output=True, text=True, timeout=30).stdout
-    except (OSError, subprocess.SubprocessError) as exc:
-        log("notification failed: {}".format(exc))
-        return
-    LAST_NOTIFY["ok"] = "|zero_breach|" in listing
-    if not LAST_NOTIFY["ok"]:
-        log("notification NOT shown: Android is blocking notifications from the Shell app")
+                       capture_output=True, timeout=30, check=True, **as_shell)
+        for _ in range(8):
+            time.sleep(0.5)
+            listing = subprocess.run(["/system/bin/cmd", "notification", "list"],
+                                     capture_output=True, text=True, timeout=30).stdout
+            if "|zero_breach|" in listing:
+                LAST_NOTIFY["ok"] = True
+                return True
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        err = (getattr(exc, "stderr", None) or b"")[-300:]
+        log("notification failed: {}{}".format(
+            str(exc)[:200], " | " + err.decode("utf-8", "replace").strip() if err else ""))
+    LAST_NOTIFY["ok"] = False
+    log("notification NOT shown (check that notifications are allowed for the Shell app and see logcat NotificationService)")
+    return False
 
 
-def shell_notifications_blocked():
-    """Passive check, without posting anything."""
+_shell_block = {"at": 0.0, "value": None}
+
+
+def shell_notifications_blocked(max_age=600):
+    """Passive check, without posting anything (cached for ten minutes)."""
+    if time.time() - _shell_block["at"] < max_age:
+        return _shell_block["value"]
     try:
         dump = subprocess.run(["/system/bin/dumpsys", "notification", "--noredact"],
                               capture_output=True, text=True, timeout=60).stdout
+        _shell_block["value"] = bool(re.search(
+            r"AppSettings: com\.android\.shell \(2000\) importance=NONE", dump))
     except (OSError, subprocess.SubprocessError):
-        return None
-    return bool(re.search(r"AppSettings: com\.android\.shell \(2000\) importance=NONE", dump))
+        _shell_block["value"] = None
+    _shell_block["at"] = time.time()
+    return _shell_block["value"]
+
+
+def send_test_notification():
+    ok = notify("Zero Breach: notifications work",
+                "Test message from the module. If you can read this, alerts will reach you.")
+    state = load_state()
+    state["notify_test"] = {"when": local_now().isoformat(timespec="seconds"), "ok": bool(ok)}
+    state["notify_failed"] = not ok
+    save_state(state)
+    log("test notification: {}".format("shown" if ok else "NOT shown"))
 
 
 def on_charger(base="/sys/class/power_supply/", suspend_file="/sys/class/qcom-battery/input_suspend"):
@@ -229,6 +281,14 @@ def fmt_day(dt):
 
 def share_label(cfg):
     return re.sub(r"^/(storage/emulated/0|sdcard)/", "", cfg["SHARE_DIR"].rstrip("/"))
+
+
+def max_gap_hours(cfg):
+    """Longest wait between two scheduled scans, so the page knows when a scan is overdue."""
+    days = sorted({int(d) for d in cfg["DAYS"].split() if d.isdigit()})
+    if len(days) < 2:
+        return 7 * 24
+    return max(((days[(i + 1) % len(days)] - days[i]) % 7 or 7) for i in range(len(days))) * 24
 
 
 def schedule_text(cfg):
@@ -349,7 +409,10 @@ def refresh_page(cfg, state, nxt):
         "last_error": state.get("last_error"),
         "last_skip": state.get("last_skip"),
         "waiting_for_charger": bool(state.get("deferred_slot")),
-        "notifications_blocked": bool(state.get("notify_blocked")),
+        "shell_blocked": bool(shell_notifications_blocked()),
+        "notify_failed": bool(state.get("notify_failed")),
+        "notify_test": state.get("notify_test"),
+        "max_gap_h": max_gap_hours(cfg),
         "config": {k: cfg[k] for k in EDITABLE},
         "set_cmd": "{} -I -B -X utf8 {}".format(sys.executable, os.path.join(CODE, "set_config.py")),
     }
@@ -438,11 +501,11 @@ def run_scan(slot, cfg, manual):
         publish_text(cfg, txt, header)
         label = share_label(cfg)
         if serious:
-            desc = "🔴 {} {} serious findings out of {} - read {}/latest.txt".format(when, len(serious), len(hits), label)
+            desc = "🔴 {} ALERT: {} serious findings - read {}/latest.txt".format(when, len(serious), label)
         elif hits:
-            desc = "🟡 {} {} mentions in saved content, no sign of contact".format(when, len(hits))
+            desc = "🟢 {} no threat found; {} harmless mentions in saved content (not an all-clear)".format(when, len(hits))
         else:
-            desc = "🟢 {} no known indicator found ({} known gaps, not an all-clear)".format(when, gaps)
+            desc = "🟢 {} no known threat found ({} known gaps, not an all-clear)".format(when, gaps)
         if new and cfg["NOTIFY"] == "1":
             if serious:
                 notify("Zero Breach: {} findings to review".format(len(serious)),
@@ -460,7 +523,7 @@ def run_scan(slot, cfg, manual):
         state["last_slot"] = slot.date().isoformat()
     state["last_desc"] = desc
     if LAST_NOTIFY["ok"] is not None:
-        state["notify_blocked"] = not LAST_NOTIFY["ok"]
+        state["notify_failed"] = not LAST_NOTIFY["ok"]
     set_desc(compose_desc(state, None))
     save_state(state)
     refresh_page(cfg, state, None)
@@ -485,6 +548,7 @@ def main():
         fh.write(str(os.getpid()))
     signal.signal(signal.SIGUSR1, _on_usr1)
     signal.signal(signal.SIGHUP, _on_hup)
+    signal.signal(signal.SIGUSR2, _on_usr2)
     signal.signal(signal.SIGTERM, _on_term)
     try:
         with open("/proc/self/oom_score_adj", "w") as fh:
@@ -496,11 +560,8 @@ def main():
     state = load_state()
     if state.get("running"):  # the previous scheduler died mid-scan
         state["running"] = None
-    blocked = shell_notifications_blocked()
-    if blocked is not None:
-        state["notify_blocked"] = blocked
-        if blocked:
-            log("WARNING: notifications from the Shell app are blocked on this phone; alerts will only show on the web page and in the module description")
+    if shell_notifications_blocked():
+        log("WARNING: notifications from the Shell app are blocked on this phone; alerts will only show on the web page and in the module description")
     save_state(state)
 
     while True:
@@ -540,6 +601,8 @@ def main():
                 log("manual run error: {!r}".format(exc))
         except Reload:
             log("settings changed, reloading")
+        except TestNotify:
+            send_test_notification()
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001 - keep the scheduler alive
@@ -564,7 +627,7 @@ def skip_if_window_closed(state, slot, cfg):
         notify("Zero Breach: scan of {} skipped".format(when),
                "The phone was not charging during the night window (ONLY_CHARGING=1). It will try again at the next scheduled night.")
     if LAST_NOTIFY["ok"] is not None:
-        state["notify_blocked"] = not LAST_NOTIFY["ok"]
+        state["notify_failed"] = not LAST_NOTIFY["ok"]
     save_state(state)
 
 

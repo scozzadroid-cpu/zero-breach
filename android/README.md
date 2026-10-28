@@ -53,16 +53,22 @@ rendered against the real scan data with a DOM stub only).
 
 ## Use
 
-* **Web page** — open the module's WebUI button: last result, history, findings
-  grouped per file, what could not be checked, the full report, next run, whether a
+* **Web page** — open the module's WebUI button. A black-and-red page opens with one
+  verdict: **Clear** (no known threat found), **Attention** (nothing dangerous, but the scan
+  is overdue, failed, was skipped or the indicator list is old) or **Alert** (serious
+  findings, with what to do). Below it: system tiles (next scan, indicator list, Zero Breach
+  version, alerts working?), the findings grouped per file in plain language, history,
+  settings, what could not be checked, the full report, next run, whether a
   newer Zero Breach exists, and a *Scan now* button. The same page is written as
   one self-contained file, `index.html`, next to `latest.txt` in `SHARE_DIR`.
 * **Notifications** — only when *new* findings appear, a scan fails, a night is skipped,
   or a new Zero Breach release is out. The same unchanged finding is not repeated every
-  night. They are posted through `cmd notification`, i.e. as the Android **Shell** app, and
-  the module checks that each one actually appeared. Some ROMs block that app: then the
-  web page shows a warning and alerts remain visible only on the page and in the module
-  description until you enable *Settings → Apps → Shell → Notifications*.
+  night. They go through `cmd notification post`, which must run as the Shell user
+  (uid 2000): as root it asks for a package called `root`, and Android drops the
+  notification silently. The module posts as the Shell user and then checks the active
+  listing, so a notification that did not appear is logged and shown on the page. Some ROMs
+  block the Shell app (*Settings → Apps → Shell → Notifications*). The page's **Send test
+  notification** button runs the whole path and records the result.
 * **Action button** — starts the service if it is not running, otherwise runs a scan now.
 * **Module description** — shows the last result and the next run.
 
